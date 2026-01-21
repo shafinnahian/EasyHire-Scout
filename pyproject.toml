@@ -1,0 +1,31 @@
+[project]
+name = "easyhire-scout"
+version = "0.1.0"
+description = "AI-powered job scraper with LLM-based resume matching"
+requires-python = ">=3.10"
+
+dependencies = [
+    "fastapi>=0.128.0, <0.129.0",
+    "uvicorn==0.32.0",
+    "sqlalchemy==2.0.46",
+    "psycopg2-binary==2.9.10",
+    "requests>=2.32.5, <3.0.0",
+    "beautifulsoup4==4.12.3",
+    "ollama==0.4.4",
+    "langchain==1.2.6",
+    "langchain-community==0.4.1",
+    "pypdf==6.6.0",
+    "scikit-learn==1.8.0",
+    "python-dotenv==1.0.1",
+    "pydantic>=2.12.5,<3.0.0",
+]
+
+[project.optional-dependencies]
+embeddings = [
+    "faiss-cpu==1.9.0.post1",
+    "sentence-transformers==5.2.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
