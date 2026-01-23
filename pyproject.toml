@@ -5,7 +5,7 @@ description = "AI-powered job scraper with LLM-based resume matching"
 requires-python = ">=3.10"
 
 dependencies = [
-    "fastapi>=0.128.0, <0.129.0",
+    "fastapi[standard]>=0.128.0, <0.129.0",
     "uvicorn==0.32.0",
     "sqlalchemy==2.0.46",
     "psycopg2-binary==2.9.10",
@@ -29,3 +29,6 @@ embeddings = [
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["easyhire_scout"]
