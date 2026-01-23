@@ -62,6 +62,21 @@ Built an AI‑powered FastAPI platform that scrapes European tech job postings, 
 
 For detailed information about why each package is used in this project, see [DEPENDENCIES.md](DEPENDENCIES.md).
 
-## Usage
+## Database Schema
 
-[Add usage instructions here]
+The database follows a 3NF normalized design with 12 core tables. The Entity Relationship Diagram (ERD) below illustrates the complete database structure:
+
+![EasyHire Scout - Stage 1 Database Schema](docs/easyhire_stage_1_ERD.png)
+
+**Database Tables:**
+- **Core entities**: `companies`, `locations`, `job_categories`
+- **Scraping tracking**: `scrape_sites`, `scrape_runs`, `scrape_errors`
+- **Jobs**: `jobs`, `job_languages`
+- **Skills**: `skills`, `skill_variants`
+- **Junction tables**: `job_categories_link`, `job_skills`
+
+The SQLAlchemy models are defined in `easyhire_scout/models.py` and match the PostgreSQL schema exactly. To initialize the database, run:
+
+```bash
+python scripts/init_db.py
+```
