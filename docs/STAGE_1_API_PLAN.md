@@ -17,8 +17,8 @@ This document outlines the complete plan for implementing the Stage 1 FastAPI en
 ## Key Decisions Made
 
 ### 1. **Rate Limiting**
-- **Decision**: Not implemented in Stage 1
-- **Rationale**: Focus on core functionality first, add rate limiting in later stages if needed
+- **Decision**: Not implemented in Stage 1.0.1
+- **Rationale**: Focus on core functionality first, add rate limiting in later sub-stages if needed
 
 ### 2. **Job Creation**
 - **Decision**: `POST /api/v1/jobs` will handle related entities (skills, languages, categories) in one request
