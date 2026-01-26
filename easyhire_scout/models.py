@@ -126,6 +126,7 @@ class ScrapeRun(Base):
     jobs_found: Mapped[int] = mapped_column(Integer, default=0)
     jobs_saved: Mapped[int] = mapped_column(Integer, default=0)
     warnings: Mapped[Optional[dict]] = mapped_column(JSONB)
+    search_criteria: Mapped[Optional[dict]] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP, server_default=func.now()
     )
