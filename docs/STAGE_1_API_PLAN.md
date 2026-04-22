@@ -25,46 +25,45 @@ This document outlines the complete plan for implementing the Stage 1 FastAPI en
 
 ## Key Decisions Made
 
-### 1. **Rate Limiting**
-- **Decision**: Not implemented in Stage 1.0.1
-- **Rationale**: Focus on core functionality first, add rate limiting in later sub-stages if needed
+### 1. **Background Execution**
+- **Decision**: Use **Celery** with **Redis** as the message broker.
+- **Rationale**: 
+  - **Persistence**: Tasks are not lost if the server restarts (critical for long-running AI pipelines).
+  - **Retries**: Essential for scraping and LLM calls which may fail due to rate limits.
+  - **Scalability**: Decouples the API from heavy compute (Ollama), allowing independent scaling.
+  - **AI Engineering**: Industry standard for data-intensive background processing.
 
 ### 2. **Job Creation**
-- **Decision**: Jobs are **only created by the scraping bot** - no public `POST /api/v1/jobs` endpoint
+- **Decision**: Jobs are **only created by the scraping bot** - no public `POST /api/v1/jobs` endpoint.
 - **Rationale**: 
-  - This is a scraper bot, not a general job board
-  - Jobs come exclusively from scraping operations
-  - Scraping services will use the service layer directly (not via API)
-  - Manual job entry/testing can be done via database or admin tools (not Stage 1 scope)
+  - This is a scraper bot, not a general job board.
+  - Jobs come exclusively from scraping operations.
+  - Scraping services will use the service layer directly (not via API).
 
 ### 3. **Scraping Configuration**
-- **Decision**: `POST /api/v1/scraping/start` accepts detailed search criteria (role, language, location, strictness)
+- **Decision**: `POST /api/v1/scraping/start` accepts search criteria and triggers the background scraper.
 - **Rationale**:
-  - Users need to configure what jobs to scrape
-  - Search criteria determine which jobs are discovered and stored
-  - Language strictness allows filtering (e.g., "strictly English" means only English-language jobs)
+  - Users need to configure what jobs to scrape.
+  - Search criteria determine which jobs are discovered and stored.
 
-### 4. **Soft Delete**
-- **Decision**: Use soft delete (`is_active=False`) instead of hard delete
+### 4. **Soft Delete & Lifecycle (The Freshness Invariant)**
+- **Decision**: Use **Cohort-Scoped Differential Inactivation**.
 - **Rationale**: 
-  - Preserves data integrity and scraping history
-  - Allows for job reactivation if needed
-  - Better for analytics and auditing
-  - Jobs can be marked inactive when they expire or are removed from source sites
+  - **Cohort Management**: Jobs are grouped by `SearchCriteria` (site + role + location). This prevents a scrape in "Germany" from accidentally inactivating jobs in "France".
+  - **The Freshness Invariant**: The scraper must bump the `last_seen_at` timestamp for every job found in a run.
+  - **Scoped Inactivation**: At the end of a successful run, all active jobs belonging to that specific `SearchCriteria` with a `last_seen_at` older than the run start time are marked as `is_active=False`.
 
 ### 5. **Search Implementation**
-- **Decision**: Use simpler LIKE-based search for Stage 1
+- **Decision**: Use PostgreSQL Full-Text Search (FTS).
 - **Rationale**: 
-  - Easier to implement and understand
-  - Sufficient for initial requirements
-  - Can upgrade to PostgreSQL full-text search later (indexes already exist in schema)
+  - Already implemented GIN indexes in the schema.
+  - Significantly faster and more accurate than `LIKE` for large text blocks.
 
 ### 6. **Response Format**
-- **Decision**: Include all necessary related data (company, location, skills, languages, categories) in job responses
+- **Decision**: Initially include core related data (company, location, skills) in job responses, and broaden over time (languages, categories, runs).
 - **Rationale**: 
-  - Reduces number of API calls needed
-  - Better user experience
-  - Single source of truth for job information
+  - Reduces round-trips for the frontend.
+  - Starting simple and adding complexity progressively manages development scope without abandoning the "single source of truth" principle.
 
 ---
 
@@ -82,6 +81,7 @@ This document outlines the complete plan for implementing the Stage 1 FastAPI en
 | GET | `/api/v1/scraping/runs/{run_id}` | Get scraping run details | HIGH |
 | GET | `/api/v1/scraping/runs/{run_id}/jobs` | Get jobs from a specific scraping run | HIGH |
 | GET | `/api/v1/scraping/runs/{run_id}/errors` | Get errors from a scraping run | HIGH |
+| GET | `/api/v1/scraping/sites` | List available scraping sources (LinkedIn, Indeed, etc.) | HIGH |
 
 **Query Parameters for GET `/api/v1/scraping/runs`**:
 - `status` (str, optional) - Filter by status: "running", "completed", "failed", "cancelled"
@@ -97,6 +97,7 @@ This document outlines the complete plan for implementing the Stage 1 FastAPI en
   "location": "Germany",
   "language": "English",
   "language_strict": true,
+  "skills": ["FastAPI", "PostgreSQL", "Docker"],
   "additional_filters": {
     "years_min": 3,
     "years_max": 10,
@@ -111,6 +112,7 @@ This document outlines the complete plan for implementing the Stage 1 FastAPI en
 - `location` (str, required) - Location to search in (e.g., "Germany", "Berlin", "Remote")
 - `language` (str, required) - Language requirement (e.g., "English", "German")
 - `language_strict` (bool, required) - If `true`, only return jobs strictly in the specified language; if `false`, include jobs that may have mixed languages
+- `skills` (list[str], optional) - List of skills to prioritize or filter by during extraction.
 - `additional_filters` (object, optional) - Additional search criteria:
   - `years_min` (int, optional) - Minimum years of experience
   - `years_max` (int, optional) - Maximum years of experience
@@ -131,7 +133,13 @@ This document outlines the complete plan for implementing the Stage 1 FastAPI en
     "job_role": "Python Developer",
     "location": "Germany",
     "language": "English",
-    "language_strict": true
+    "language_strict": true,
+    "skills": ["FastAPI", "PostgreSQL", "Docker"],
+    "additional_filters": {
+      "years_min": 3,
+      "years_max": 10,
+      "job_type": "full_time"
+    }
   },
   "started_at": "2024-01-15T10:00:00Z",
   "message": "Scraping run started successfully"
@@ -162,7 +170,7 @@ This document outlines the complete plan for implementing the Stage 1 FastAPI en
 - `requires_german` (bool, optional) - Filter by German requirement
 - `job_type` (str, optional) - Filter by job type (e.g., "full_time", "part_time")
 - `is_active` (bool, optional, default: true) - Filter by active status
-- `search` (str, optional) - LIKE-based search on title/description
+- `q` (str, optional) - **Full-Text Search** query on title/description (uses `ts_rank` for relevancy)
 - `posted_after` (datetime, optional) - Filter by posted date (after)
 - `posted_before` (datetime, optional) - Filter by posted date (before)
 - `scrape_run_id` (int, optional) - Filter by scraping run that discovered this job
@@ -181,7 +189,7 @@ This document outlines the complete plan for implementing the Stage 1 FastAPI en
 **Query Parameters for GET `/api/v1/companies`**:
 - `page` (int, default: 1)
 - `page_size` (int, default: 20)
-- `search` (str, optional) - Search by company name
+- `q` (str, optional) - Search by company name (FTS)
 
 #### 4. Locations API
 **Base Path**: `/api/v1/locations`
@@ -221,13 +229,6 @@ This document outlines the complete plan for implementing the Stage 1 FastAPI en
 | Method | Endpoint | Description | Priority |
 |--------|----------|-------------|----------|
 | GET | `/api/v1/categories` | List all categories | LOW |
-
-#### 7. Scrape Sites API
-**Base Path**: `/api/v1/scrape-sites`
-
-| Method | Endpoint | Description | Priority |
-|--------|----------|-------------|----------|
-| GET | `/api/v1/scrape-sites` | List available scraping sources (LinkedIn, Indeed, etc.) | LOW |
 
 ---
 
@@ -395,7 +396,7 @@ easyhire_scout/
 │       ├── skills.py      # Skills endpoints (read-only)
 │       ├── categories.py  # Category endpoints (read-only)
 │       ├── scraping.py    # Scraping management endpoints
-│       └── scrape_sites.py # Scrape sites endpoints (read-only)
+│       └── scraping_sites.py # Scrape sites endpoints (under /scraping/sites)
 │
 ├── schemas/               # Pydantic models (request/response)
 │   ├── __init__.py
@@ -465,6 +466,7 @@ easyhire_scout/
   - `200` - Success
   - `201` - Created (for scraping run creation)
   - `400` - Bad Request
+  - `422` - Unprocessable Entity (FastAPI validation errors)
   - `404` - Not Found
   - `500` - Internal Server Error
 
@@ -491,13 +493,14 @@ easyhire_scout/
    - `GET /api/v1/scraping/runs/{run_id}` - Get run details
    - `GET /api/v1/scraping/runs/{run_id}/jobs` - Get jobs from run
    - `GET /api/v1/scraping/runs/{run_id}/errors` - Get errors from run
+   - `GET /api/v1/scraping/sites` - List available scraping sources
 4. Test scraping endpoints
 
 **Note**: The actual scraping logic (web scraping, parsing, etc.) is **not** part of Stage 1 API implementation. The API will:
 - Accept scraping configuration
 - Create a `ScrapeRun` record
 - Return immediately with `status: "running"`
-- The scraping bot/service (separate component) will update the run status and create job records
+- The Celery worker will pick up the task, update the run status, and create job records
 
 ### Phase 3: Jobs API (Priority 2 - Read-Only)
 1. Create job response schemas (no request schemas for creation)
@@ -515,7 +518,6 @@ easyhire_scout/
 2. Locations API (read-only)
 3. Skills API (read-only)
 4. Categories API (read-only)
-5. Scrape Sites API (read-only)
 
 ### Phase 5: Testing & Refinement
 1. Test all endpoints
@@ -528,19 +530,22 @@ easyhire_scout/
 
 ## Technical Notes
 
-### Search Implementation (LIKE-based)
-- Use SQLAlchemy's `ilike()` for case-insensitive search
-- Search on: `title`, `description`, `requirements`
-- Example query:
+### Search Implementation (PostgreSQL FTS)
+- Use SQLAlchemy `func.to_tsvector` and `func.plainto_tsquery`.
+- Leverage existing GIN indexes: `idx_jobs_title` and `idx_jobs_description_fts`.
+- Query structure:
   ```python
   query = query.filter(
-      or_(
-          Job.title.ilike(f"%{search_term}%"),
-          Job.description.ilike(f"%{search_term}%"),
-          Job.requirements.ilike(f"%{search_term}%")
-      )
-  )
+      text("to_tsvector('english', jobs.description) @@ plainto_tsquery('english', :search_term)")
+  ).params(search_term=search_term)
   ```
+
+### Differential Inactivation (The Freshness Invariant)
+- After a successful scrape run:
+  1. Identify the `SearchCriteria` cohort of the current run.
+  2. Mark `is_active = False` for all jobs where:
+     - `search_criteria_id == current_run.search_criteria_id`
+     - `last_seen_at < current_run.started_at`
 
 ### Soft Delete Implementation
 - Update `is_active=False` instead of deleting
@@ -571,11 +576,11 @@ easyhire_scout/
 ### Scraping Run Status Management
 - Status values: `"running"`, `"completed"`, `"failed"`, `"cancelled"`
 - When `POST /scraping/start` is called:
-  1. Create `ScrapeRun` record with `status="running"`
-  2. Store search criteria (may need to extend `scrape_runs` table or store as JSON)
-  3. Return immediately with run ID
-  4. Actual scraping happens asynchronously (separate service/worker)
-  5. Scraping service updates run status and creates job records
+  1. Resolve `SearchCriteria` (create if new)
+  2. Create `ScrapeRun` record with `status="running"` and link to `search_criteria_id`
+  3. Enqueue Celery task with the run ID
+  4. Return immediately with run ID
+  5. Celery worker updates run status and creates job records
 
 ---
 
@@ -608,6 +613,6 @@ easyhire_scout/
 ---
 
 **Document Version**: 2.0  
-**Last Updated**: 2024  
+**Last Updated**: 2026-04-22 (Architecture & Consistency Pass)  
 **Status**: Planning Complete - Ready for Implementation  
 **Key Change**: Revised to reflect job scraper bot architecture (jobs only created by scraping, no manual job creation endpoints)

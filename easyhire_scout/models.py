@@ -111,12 +111,44 @@ class ScrapeSite(Base):
     )
 
 
+class SearchCriteria(Base):
+    __tablename__ = "search_criteria"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    scrape_site_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("scrape_sites.id", ondelete="CASCADE")
+    )
+    job_role: Mapped[str] = mapped_column(String(255), nullable=False)
+    location: Mapped[str] = mapped_column(String(255), nullable=False)
+    language: Mapped[str] = mapped_column(String(50), nullable=False)
+    language_strict: Mapped[bool] = mapped_column(Boolean, default=True)
+    
+    # Storage for skills and additional_filters (years_min, job_type, etc.)
+    # This ensures the cohort_hash captures the ENTIRE state of the search
+    parameters: Mapped[Optional[dict]] = mapped_column(JSONB)
+    
+    normalized_role: Mapped[Optional[str]] = mapped_column(String(255))
+    normalized_location: Mapped[Optional[str]] = mapped_column(String(255))
+    cohort_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP, server_default=func.now()
+    )
+
+    __table_args__ = (
+        Index("idx_search_criteria_cohort", "cohort_hash"),
+        Index("idx_search_criteria_site_role_loc", "scrape_site_id", "job_role", "location"),
+    )
+
+
 class ScrapeRun(Base):
     __tablename__ = "scrape_runs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     scrape_site_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("scrape_sites.id", ondelete="SET NULL")
+    )
+    search_criteria_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("search_criteria.id", ondelete="SET NULL")
     )
     started_at: Mapped[datetime] = mapped_column(
         TIMESTAMP, server_default=func.now()
@@ -126,13 +158,13 @@ class ScrapeRun(Base):
     jobs_found: Mapped[int] = mapped_column(Integer, default=0)
     jobs_saved: Mapped[int] = mapped_column(Integer, default=0)
     warnings: Mapped[Optional[dict]] = mapped_column(JSONB)
-    search_criteria: Mapped[Optional[dict]] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP, server_default=func.now()
     )
 
     __table_args__ = (
         Index("idx_scrape_runs_site", "scrape_site_id"),
+        Index("idx_scrape_runs_criteria", "search_criteria_id"),
         Index("idx_scrape_runs_status", "status"),
         Index("idx_scrape_runs_started", "started_at"),
     )
@@ -177,6 +209,9 @@ class Job(Base):
     scrape_run_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("scrape_runs.id", ondelete="SET NULL")
     )
+    search_criteria_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("search_criteria.id", ondelete="SET NULL")
+    )
     source_site_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("scrape_sites.id", ondelete="SET NULL")
     )
@@ -215,6 +250,9 @@ class Job(Base):
     scraped_at: Mapped[datetime] = mapped_column(
         TIMESTAMP, server_default=func.now()
     )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        TIMESTAMP, server_default=func.now()
+    )
 
     # Source
     source_url: Mapped[str] = mapped_column(String(500), unique=True, nullable=False)
@@ -235,8 +273,10 @@ class Job(Base):
         Index("idx_jobs_company", "company_id"),
         Index("idx_jobs_location", "location_id"),
         Index("idx_jobs_scrape_run", "scrape_run_id"),
+        Index("idx_jobs_criteria", "search_criteria_id"),
         Index("idx_jobs_source_site", "source_site_id"),
         Index("idx_jobs_years", "years_min", "years_max"),
+        Index("idx_jobs_last_seen", "last_seen_at"),
         Index(
             "idx_jobs_title",
             text("to_tsvector('english', title)"),

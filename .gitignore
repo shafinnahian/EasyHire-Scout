@@ -33,3 +33,7 @@ build/
 
 # Alembic
 alembic/README
+
+.cursor/
+
+guideline/
