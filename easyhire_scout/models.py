@@ -57,9 +57,14 @@ class Company(Base):
     )
 
     __table_args__ = (
-        Index("idx_companies_name", "name"),
+        Index("idx_companies_name_btree", "name"),
         Index("idx_companies_normalized_name", "normalized_name"),
         Index("idx_companies_headquarters_location", "headquarters_location_id"),
+        Index(
+            "idx_companies_name_fts",
+            text("to_tsvector('english', name)"),
+            postgresql_using="gin",
+        ),
     )
 
 
@@ -112,6 +117,20 @@ class ScrapeSite(Base):
 
 
 class SearchCriteria(Base):
+    """
+    Represents a unique 'Search Intent' or 'Cohort' for the scraper.
+    
+    ARCHITECTURAL DECISION:
+    1. Canonical Hashing Protocol: `cohort_hash` MUST be generated using a strict 
+       canonicalization pipeline (lowercase, sort arrays, deterministic JSON string) 
+       BEFORE hashing (SHA-256). This guarantees mathematical uniqueness and prevents
+       duplicate scraping runs for identical intents (e.g. skills=["A", "B"] vs ["B", "A"]).
+    
+    2. JSONB Configuration: `parameters` deliberately violates strict 3NF. 
+       This table is an IMMUTABLE INTENT LOG, not an analytical query target. 
+       Storing skills/filters as JSONB keeps the POST /start API lightning fast 
+       by avoiding synchronous string-to-entity database resolution.
+    """
     __tablename__ = "search_criteria"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -339,7 +358,12 @@ class Skill(Base):
 
     __table_args__ = (
         Index("idx_skills_category", "category"),
-        Index("idx_skills_canonical_name", "canonical_name"),
+        Index("idx_skills_canonical_name_btree", "canonical_name"),
+        Index(
+            "idx_skills_name_fts",
+            text("to_tsvector('english', canonical_name)"),
+            postgresql_using="gin",
+        ),
     )
 
 

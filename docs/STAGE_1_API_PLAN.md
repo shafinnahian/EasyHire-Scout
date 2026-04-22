@@ -27,7 +27,7 @@ This document outlines the complete plan for implementing the Stage 1 FastAPI en
 
 ### 1. **Background Execution**
 - **Decision**: Use **Celery** with **Redis** as the message broker.
-- **Rationale**: 
+- **WHY**: 
   - **Persistence**: Tasks are not lost if the server restarts (critical for long-running AI pipelines).
   - **Retries**: Essential for scraping and LLM calls which may fail due to rate limits.
   - **Scalability**: Decouples the API from heavy compute (Ollama), allowing independent scaling.
@@ -35,35 +35,49 @@ This document outlines the complete plan for implementing the Stage 1 FastAPI en
 
 ### 2. **Job Creation**
 - **Decision**: Jobs are **only created by the scraping bot** - no public `POST /api/v1/jobs` endpoint.
-- **Rationale**: 
+- **WHY**: 
   - This is a scraper bot, not a general job board.
   - Jobs come exclusively from scraping operations.
   - Scraping services will use the service layer directly (not via API).
 
 ### 3. **Scraping Configuration**
 - **Decision**: `POST /api/v1/scraping/start` accepts search criteria and triggers the background scraper.
-- **Rationale**:
+- **WHY**:
   - Users need to configure what jobs to scrape.
   - Search criteria determine which jobs are discovered and stored.
 
 ### 4. **Soft Delete & Lifecycle (The Freshness Invariant)**
 - **Decision**: Use **Cohort-Scoped Differential Inactivation**.
-- **Rationale**: 
+- **WHY**: 
   - **Cohort Management**: Jobs are grouped by `SearchCriteria` (site + role + location). This prevents a scrape in "Germany" from accidentally inactivating jobs in "France".
   - **The Freshness Invariant**: The scraper must bump the `last_seen_at` timestamp for every job found in a run.
   - **Scoped Inactivation**: At the end of a successful run, all active jobs belonging to that specific `SearchCriteria` with a `last_seen_at` older than the run start time are marked as `is_active=False`.
 
 ### 5. **Search Implementation**
 - **Decision**: Use PostgreSQL Full-Text Search (FTS).
-- **Rationale**: 
+- **WHY**: 
   - Already implemented GIN indexes in the schema.
   - Significantly faster and more accurate than `LIKE` for large text blocks.
 
 ### 6. **Response Format**
 - **Decision**: Initially include core related data (company, location, skills) in job responses, and broaden over time (languages, categories, runs).
-- **Rationale**: 
+- **WHY**: 
   - Reduces round-trips for the frontend.
   - Starting simple and adding complexity progressively manages development scope without abandoning the "single source of truth" principle.
+
+### 7. **Cohort Resolution**
+- **Decision**: Use a **Canonical Hashing Protocol** to generate `cohort_hash`.
+- **WHY**: 
+  - Ensures mathematical uniqueness of search intent.
+  - Prevents permutation flaws (e.g., `["Python", "Docker"]` vs `["Docker", "Python"]`).
+  - Standardizes casing and eliminates duplicate scraping runs.
+
+### 8. **Search Configuration Storage**
+- **Decision**: Retain `JSONB` for search parameters, rejecting strict 3NF for the `SearchCriteria` table.
+- **WHY**: 
+  - `SearchCriteria` is an immutable intent log, not an analytical query target.
+  - Keeps the `POST /start` endpoint extremely fast by avoiding synchronous string-to-entity resolution.
+  - Allows schema flexibility for future scraper filters without requiring DDL migrations.
 
 ---
 
@@ -216,7 +230,7 @@ This document outlines the complete plan for implementing the Stage 1 FastAPI en
 | GET | `/api/v1/skills/{skill_id}` | Get skill details | MEDIUM |
 
 **Query Parameters for GET `/api/v1/skills`**:
-- `search` (str, optional) - Search by skill name
+- `q` (str, optional) - Search by skill name (FTS)
 - `category` (str, optional) - Filter by category
 - `page` (int, default: 1)
 - `page_size` (int, default: 20)
