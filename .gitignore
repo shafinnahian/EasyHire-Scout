@@ -36,4 +36,7 @@ alembic/README
 
 .cursor/
 
+# Redis persistence
+dump.rdb
+
 guideline/
