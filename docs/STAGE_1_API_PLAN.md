@@ -1,632 +1,192 @@
-# Stage 1 API Implementation Plan
+# Stage 1 API Implementation Plan (Version 3.1)
 
 ## Overview
 
-This document outlines the complete plan for implementing the Stage 1 FastAPI endpoints for EasyHire Scout. **EasyHire Scout is a job scraper bot** that scrapes jobs from major job posting sites based on user-defined search criteria (role, language, location, strictness). The API in Stage 1 focuses on:
+This document outlines the complete plan for implementing the Stage 1 FastAPI endpoints for EasyHire Scout. **EasyHire Scout is a job scraper bot** that leverages AI to discover, extract, and categorize job postings from major sites based on user-defined search criteria.
 
-- **Configuring and executing scraping runs** with specific search criteria
-- **Viewing scraped jobs** (read-only access to jobs discovered by the scraper)
-- **Tracking scraping operations** and errors
-- **Providing comprehensive job information** in single API calls
+The API focuses on:
+- **Configuring and executing scraping runs** with specific search criteria.
+- **Viewing scraped jobs** with advanced FTS (Full-Text Search) ranking.
+- **Tracking scraping operations** through a persistent distributed task queue.
 
-**Important**: Jobs are **only created by the scraping bot** - there are no manual job creation endpoints. The API is primarily for configuring scrapes and viewing scraped results.
-
----
-
-## Project Goals
-
-- Build RESTful API endpoints for **scraping configuration and execution**
-- Enable **read-only access** to scraped jobs with filtering and search capabilities
-- Track scraping operations, runs, and errors
-- Provide comprehensive job information (with related entities) in single API calls
-- Establish a scalable architecture for future enhancements (e.g., resume matching, job recommendations)
+**Guiding Principle**: Jobs are **exclusively created by the scraping bot**. The API is a window into the discovered data and a control panel for the scraper.
 
 ---
 
-## Key Decisions Made
+## Key Decisions Made (Architectural Refined)
 
-### 1. **Background Execution**
-- **Decision**: Use **Celery** with **Redis** as the message broker.
+### 1. **Background Execution & Monitoring**
+- **Decision**: Use **Celery** with **Redis** and **Database State Monitoring**.
 - **WHY**: 
-  - **Persistence**: Tasks are not lost if the server restarts (critical for long-running AI pipelines).
-  - **Retries**: Essential for scraping and LLM calls which may fail due to rate limits.
-  - **Scalability**: Decouples the API from heavy compute (Ollama), allowing independent scaling.
-  - **AI Engineering**: Industry standard for data-intensive background processing.
+  - **Persistence**: Scraping and LLM tasks are resource-heavy; Celery ensures tasks aren't lost on server restarts.
+  - **Fault Tolerance**: Automatic retries handle flaky site connections and LLM timeouts.
+  - **Monitoring**: Integration with Flower for real-time visibility.
 
-### 2. **Job Creation**
-- **Decision**: Jobs are **only created by the scraping bot** - no public `POST /api/v1/jobs` endpoint.
+### 2. **Success-Triggered Differential Inactivation (The 2-Run Rule)**
+- **Decision**: Use **Cohort-Scoped Success-Triggered Inactivation**.
 - **WHY**: 
-  - This is a scraper bot, not a general job board.
-  - Jobs come exclusively from scraping operations.
-  - Scraping services will use the service layer directly (not via API).
+  - **The 2-Run Rule**: A job is marked `is_active=False` only if it has been missing for **two consecutive successful runs**. This prevents accidental deletion due to "partial scrapes".
+  - **Success Trigger**: Inactivation only runs if the `ScrapeRun` status is `completed` AND `jobs_found > 0`.
+  - **Cohort Management**: Targets only jobs within the same `SearchCriteria` (site + role + location).
 
-### 3. **Scraping Configuration**
-- **Decision**: `POST /api/v1/scraping/start` accepts search criteria and triggers the background scraper.
-- **WHY**:
-  - Users need to configure what jobs to scrape.
-  - Search criteria determine which jobs are discovered and stored.
-
-### 4. **Soft Delete & Lifecycle (The Freshness Invariant)**
-- **Decision**: Use **Cohort-Scoped Differential Inactivation**.
+### 3. **Platform-Wide Linguistic Search (PostgreSQL FTS)**
+- **Decision**: PostgreSQL Full-Text Search (FTS) with `ts_rank` + GIN Indexes.
 - **WHY**: 
-  - **Cohort Management**: Jobs are grouped by `SearchCriteria` (site + role + location). This prevents a scrape in "Germany" from accidentally inactivating jobs in "France".
-  - **The Freshness Invariant**: The scraper must bump the `last_seen_at` timestamp for every job found in a run.
-  - **Scoped Inactivation**: At the end of a successful run, all active jobs belonging to that specific `SearchCriteria` with a `last_seen_at` older than the run start time are marked as `is_active=False`.
+  - **Strict Deprecation of LIKE**: `LIKE/ILIKE` is deprecated across the entire platform (Jobs, Companies, Skills).
+  - **Ranking**: Uses `ts_rank` to provide relevance-based results (e.g., matching "Python" in title ranks higher than description).
 
-### 5. **Search Implementation**
-- **Decision**: Use PostgreSQL Full-Text Search (FTS).
-- **WHY**: 
-  - Already implemented GIN indexes in the schema.
-  - Significantly faster and more accurate than `LIKE` for large text blocks.
+### 4. **Canonical Hashing Protocol (Cohort Resolution)**
+- **Decision**: Generate a `cohort_hash` via a 4-step canonicalization pipeline.
+- **WHY**: Ensures that permutations like `["Python", "FastAPI"]` vs `["FastAPI", "python"]` resolve to the same intent, preventing duplicate scraping runs and data fragmentation.
 
-### 6. **Response Format**
-- **Decision**: Initially include core related data (company, location, skills) in job responses, and broaden over time (languages, categories, runs).
-- **WHY**: 
-  - Reduces round-trips for the frontend.
-  - Starting simple and adding complexity progressively manages development scope without abandoning the "single source of truth" principle.
+### 5. **Double-Headed Language Extraction**
+- **Decision**: LLM extracts both `content_language` (the text) and `requirement_language` (mandated skills).
+- **WHY**: Prevents false negatives where an English-written job post actually requires German fluency.
 
-### 7. **Cohort Resolution**
-- **Decision**: Use a **Canonical Hashing Protocol** to generate `cohort_hash`.
-- **WHY**: 
-  - Ensures mathematical uniqueness of search intent.
-  - Prevents permutation flaws (e.g., `["Python", "Docker"]` vs `["Docker", "Python"]`).
-  - Standardizes casing and eliminates duplicate scraping runs.
-
-### 8. **Search Configuration Storage**
-- **Decision**: Retain `JSONB` for search parameters, rejecting strict 3NF for the `SearchCriteria` table.
-- **WHY**: 
-  - `SearchCriteria` is an immutable intent log, not an analytical query target.
-  - Keeps the `POST /start` endpoint extremely fast by avoiding synchronous string-to-entity resolution.
-  - Allows schema flexibility for future scraper filters without requiring DDL migrations.
+### 6. **Skill Canonicalization**
+- **Decision**: Use a **Service-Layer Matcher** to map raw strings to stable IDs.
+- **WHY**: Maps variants like "JS" and "Javascript" to the same canonical "JavaScript" ID, making filters highly reliable.
 
 ---
 
 ## API Structure & Priorities
 
-### Priority 1: Scraping Configuration & Execution (Must Have)
-
-#### 1. Scraping Management API
-**Base Path**: `/api/v1/scraping`
+### Priority 1: Scraping Management API (`/api/v1/scraping`)
 
 | Method | Endpoint | Description | Priority |
 |--------|----------|-------------|----------|
-| POST | `/api/v1/scraping/start` | Start a scraping run with search criteria | HIGH |
-| GET | `/api/v1/scraping/runs` | List scraping runs with filtering | HIGH |
-| GET | `/api/v1/scraping/runs/{run_id}` | Get scraping run details | HIGH |
-| GET | `/api/v1/scraping/runs/{run_id}/jobs` | Get jobs from a specific scraping run | HIGH |
-| GET | `/api/v1/scraping/runs/{run_id}/errors` | Get errors from a scraping run | HIGH |
-| GET | `/api/v1/scraping/sites` | List available scraping sources (LinkedIn, Indeed, etc.) | HIGH |
+| POST | `/api/v1/scraping/start` | Start a scraping run (triggers Canonical Hashing) | HIGH |
+| GET | `/api/v1/scraping/runs` | List runs with status & cohort filtering | HIGH |
+| GET | `/api/v1/scraping/runs/{id}` | Get run details, stats, and warnings | HIGH |
+| GET | `/api/v1/scraping/runs/{id}/jobs`| Get jobs discovered by a specific run | HIGH |
+| GET | `/api/v1/scraping/sites` | List available scraping sources (LinkedIn, etc.) | HIGH |
 
-**Query Parameters for GET `/api/v1/scraping/runs`**:
-- `status` (str, optional) - Filter by status: "running", "completed", "failed", "cancelled"
-- `scrape_site_id` (int, optional) - Filter by scraping source (e.g., LinkedIn, Indeed)
-- `page` (int, default: 1) - Page number
-- `page_size` (int, default: 20) - Items per page
-
-**Request Body for POST `/api/v1/scraping/start`**:
-```json
-{
-  "scrape_site_id": 1,
-  "job_role": "Python Developer",
-  "location": "Germany",
-  "language": "English",
-  "language_strict": true,
-  "skills": ["FastAPI", "PostgreSQL", "Docker"],
-  "additional_filters": {
-    "years_min": 3,
-    "years_max": 10,
-    "job_type": "full_time"
-  }
-}
-```
-
-**Fields**:
-- `scrape_site_id` (int, required) - Which job site to scrape (e.g., LinkedIn, Indeed, Stack Overflow Jobs)
-- `job_role` (str, required) - The job role/title to search for (e.g., "Python Developer", "Data Scientist")
-- `location` (str, required) - Location to search in (e.g., "Germany", "Berlin", "Remote")
-- `language` (str, required) - Language requirement (e.g., "English", "German")
-- `language_strict` (bool, required) - If `true`, only return jobs strictly in the specified language; if `false`, include jobs that may have mixed languages
-- `skills` (list[str], optional) - List of skills to prioritize or filter by during extraction.
-- `additional_filters` (object, optional) - Additional search criteria:
-  - `years_min` (int, optional) - Minimum years of experience
-  - `years_max` (int, optional) - Maximum years of experience
-  - `job_type` (str, optional) - Job type filter (e.g., "full_time", "part_time", "contract")
-  - `remote` (bool, optional) - Filter for remote jobs only
-
-**Response for POST `/api/v1/scraping/start`**:
-```json
-{
-  "run_id": 42,
-  "status": "running",
-  "scrape_site": {
-    "id": 1,
-    "name": "LinkedIn",
-    "base_url": "https://linkedin.com/jobs"
-  },
-  "search_criteria": {
-    "job_role": "Python Developer",
-    "location": "Germany",
-    "language": "English",
-    "language_strict": true,
-    "skills": ["FastAPI", "PostgreSQL", "Docker"],
-    "additional_filters": {
-      "years_min": 3,
-      "years_max": 10,
-      "job_type": "full_time"
-    }
-  },
-  "started_at": "2024-01-15T10:00:00Z",
-  "message": "Scraping run started successfully"
-}
-```
-
-### Priority 2: Jobs API (Read-Only - Must Have)
-
-#### 2. Jobs API
-**Base Path**: `/api/v1/jobs`
+### Priority 2: Jobs API (`/api/v1/jobs`)
 
 | Method | Endpoint | Description | Priority |
 |--------|----------|-------------|----------|
-| GET | `/api/v1/jobs` | List scraped jobs with filtering, pagination, search | HIGH |
-| GET | `/api/v1/jobs/{job_id}` | Get job by ID with all related data | HIGH |
-
-**Note**: There are **no POST or PATCH endpoints** for jobs. Jobs are only created by the scraping bot.
-
-**Query Parameters for GET `/api/v1/jobs`**:
-- `page` (int, default: 1) - Page number
-- `page_size` (int, default: 20) - Items per page (max 100)
-- `company_id` (int, optional) - Filter by company
-- `location_id` (int, optional) - Filter by location
-- `category_id` (int, optional) - Filter by category
-- `skill_ids[]` (list[int], optional) - Filter by skills (array)
-- `years_min` (int, optional) - Minimum years of experience
-- `years_max` (int, optional) - Maximum years of experience
-- `requires_german` (bool, optional) - Filter by German requirement
-- `job_type` (str, optional) - Filter by job type (e.g., "full_time", "part_time")
-- `is_active` (bool, optional, default: true) - Filter by active status
-- `q` (str, optional) - **Full-Text Search** query on title/description (uses `ts_rank` for relevancy)
-- `posted_after` (datetime, optional) - Filter by posted date (after)
-- `posted_before` (datetime, optional) - Filter by posted date (before)
-- `scrape_run_id` (int, optional) - Filter by scraping run that discovered this job
-- `scrape_site_id` (int, optional) - Filter by source site (e.g., LinkedIn, Indeed)
-
-### Priority 3: Supporting APIs (Nice to Have)
-
-#### 3. Companies API
-**Base Path**: `/api/v1/companies`
-
-| Method | Endpoint | Description | Priority |
-|--------|----------|-------------|----------|
-| GET | `/api/v1/companies` | List companies (discovered from scraped jobs) | MEDIUM |
-| GET | `/api/v1/companies/{company_id}` | Get company details | MEDIUM |
-
-**Query Parameters for GET `/api/v1/companies`**:
-- `page` (int, default: 1)
-- `page_size` (int, default: 20)
-- `q` (str, optional) - Search by company name (FTS)
-
-#### 4. Locations API
-**Base Path**: `/api/v1/locations`
-
-| Method | Endpoint | Description | Priority |
-|--------|----------|-------------|----------|
-| GET | `/api/v1/locations` | List locations (from scraped jobs) | MEDIUM |
-| GET | `/api/v1/locations/{location_id}` | Get location details | MEDIUM |
-
-**Query Parameters for GET `/api/v1/locations`**:
-- `country` (str, optional) - Filter by country
-- `city` (str, optional) - Filter by city
-- `region` (str, optional) - Filter by region
-- `remote` (bool, optional) - Filter by remote status
-- `page` (int, default: 1)
-- `page_size` (int, default: 20)
-
-#### 5. Skills API
-**Base Path**: `/api/v1/skills`
-
-| Method | Endpoint | Description | Priority |
-|--------|----------|-------------|----------|
-| GET | `/api/v1/skills` | List/search skills (extracted from scraped jobs) | MEDIUM |
-| GET | `/api/v1/skills/{skill_id}` | Get skill details | MEDIUM |
-
-**Query Parameters for GET `/api/v1/skills`**:
-- `q` (str, optional) - Search by skill name (FTS)
-- `category` (str, optional) - Filter by category
-- `page` (int, default: 1)
-- `page_size` (int, default: 20)
-
-### Priority 4: Reference APIs (Can Defer)
-
-#### 6. Job Categories API
-**Base Path**: `/api/v1/categories`
-
-| Method | Endpoint | Description | Priority |
-|--------|----------|-------------|----------|
-| GET | `/api/v1/categories` | List all categories | LOW |
+| GET | `/api/v1/jobs` | List jobs with **FTS Ranking** and filtering | HIGH |
+| GET | `/api/v1/jobs/{job_id}` | Get job by ID with all canonicalized data | HIGH |
 
 ---
 
-## Response Format Examples
+## Response Body Examples
 
-### Job Response (GET `/api/v1/jobs/{job_id}`)
+### Job Detail Response (GET `/api/v1/jobs/{job_id}`)
 ```json
 {
   "id": 1,
   "title": "Senior Python Developer",
-  "normalized_title": "senior python developer",
-  "description": "We are looking for an experienced Python developer...",
-  "requirements": "5+ years of Python experience...",
-  "responsibilities": "Design and implement backend services...",
-  "external_id": "job-12345",
-  "years_min": 5,
-  "years_max": 8,
-  "years_overall": false,
-  "salary_min": 70000.00,
-  "salary_max": 90000.00,
-  "salary_currency": "EUR",
-  "job_type": "full_time",
-  "employment_type": "permanent",
-  "requires_german": true,
-  "posted_date": "2024-01-15T10:00:00Z",
-  "scraped_at": "2024-01-15T11:30:00Z",
-  "source_url": "https://linkedin.com/jobs/view/12345",
+  "description": "Full description here...",
+  "external_id": "linkedin-12345",
+  "content_language": "English",
+  "requirement_language": ["German", "English"],
   "is_active": true,
-  "is_duplicate": false,
-  "created_at": "2024-01-15T11:30:00Z",
-  "updated_at": "2024-01-15T11:30:00Z",
+  "last_seen_at": "2024-01-15T10:00:00Z",
+  "missing_count": 0,
+  "years_min": 5,
   "company": {
     "id": 5,
     "name": "Tech Corp",
-    "normalized_name": "tech corp",
-    "website": "https://techcorp.com",
-    "careers_url": "https://techcorp.com/careers",
-    "industry": "Technology",
-    "company_size": "51-200",
-    "founded_year": 2015
+    "industry": "Technology"
   },
   "location": {
     "id": 10,
     "city": "Berlin",
     "country": "Germany",
-    "region": "Berlin",
-    "remote": false,
-    "latitude": 52.5200,
-    "longitude": 13.4050
+    "remote": false
   },
   "skills": [
-    {
-      "id": 1,
-      "canonical_name": "Python",
-      "category": "programming_language",
-      "weight": 1.0
-    },
-    {
-      "id": 2,
-      "canonical_name": "FastAPI",
-      "category": "framework",
-      "weight": 0.7
-    }
-  ],
-  "languages": [
-    {
-      "language": "English",
-      "requirement_level": "required"
-    },
-    {
-      "language": "German",
-      "requirement_level": "preferred"
-    }
-  ],
-  "categories": [
-    {
-      "id": 1,
-      "name": "backend"
-    }
+    { "id": 1, "name": "Python", "category": "Language" },
+    { "id": 2, "name": "FastAPI", "category": "Framework" }
   ],
   "scrape_run": {
     "id": 42,
-    "scrape_site_id": 1,
-    "started_at": "2024-01-15T10:00:00Z",
-    "completed_at": "2024-01-15T11:30:00Z",
     "status": "completed",
-    "jobs_found": 150,
-    "jobs_saved": 145
-  },
-  "source_site": {
-    "id": 1,
-    "name": "LinkedIn",
-    "base_url": "https://linkedin.com/jobs"
+    "completed_at": "2024-01-15T11:00:00Z"
   }
 }
 ```
 
-### Paginated Response (GET `/api/v1/jobs`)
-```json
-{
-  "items": [
-    {
-      // Job object (same structure as above, but may exclude some nested details for list view)
-    }
-  ],
-  "total": 1250,
-  "page": 1,
-  "page_size": 20,
-  "total_pages": 63
-}
-```
-
-### Scraping Run Response (GET `/api/v1/scraping/runs/{run_id}`)
+### Scraping Run Detail (GET `/api/v1/scraping/runs/{run_id}`)
 ```json
 {
   "id": 42,
-  "scrape_site_id": 1,
-  "scrape_site": {
-    "id": 1,
-    "name": "LinkedIn",
-    "base_url": "https://linkedin.com/jobs"
-  },
-  "search_criteria": {
-    "job_role": "Python Developer",
-    "location": "Germany",
-    "language": "English",
-    "language_strict": true,
-    "additional_filters": {
-      "years_min": 3,
-      "job_type": "full_time"
-    }
-  },
-  "started_at": "2024-01-15T10:00:00Z",
-  "completed_at": "2024-01-15T11:30:00Z",
+  "cohort_hash": "a1b2c3d4e5f6...",
   "status": "completed",
   "jobs_found": 150,
   "jobs_saved": 145,
-  "warnings": [
-    "Some jobs had missing salary information",
-    "5 duplicate jobs detected"
-  ],
-  "created_at": "2024-01-15T10:00:00Z"
+  "started_at": "2024-01-15T10:00:00Z",
+  "completed_at": "2024-01-15T11:30:00Z",
+  "search_criteria": {
+    "job_role": "Python Developer",
+    "location": "Germany",
+    "scrape_site": "LinkedIn"
+  },
+  "warnings": ["Rate limited at 10:45 AM", "2 duplicate jobs found"]
 }
 ```
 
 ---
 
-## Project File Structure
+## Project File Structure (Modular & Reusable)
 
 ```
 easyhire_scout/
-├── __init__.py
-├── models.py              # SQLAlchemy models (existing)
-├── database.py            # DB connection (existing)
+├── api/                   # API Routing Layer
+│   ├── main.py            # App Entry Point
+│   └── v1/                # Versioned Endpoints
+│       ├── jobs.py        # Job retrieval with FTS ranking
+│       ├── scraping.py    # Scraping control & run monitoring
+│       ├── companies.py   # Company directory (FTS enabled)
+│       ├── locations.py   # Location directory
+│       ├── skills.py      # Skill directory (FTS enabled)
+│       └── categories.py  # Category management
 │
-├── api/                   # API routes/endpoints
-│   ├── __init__.py
-│   ├── main.py            # FastAPI app instance
-│   └── v1/                # API versioning
-│       ├── __init__.py
-│       ├── router.py      # Main router (includes all routes)
-│       ├── jobs.py        # Job endpoints (read-only)
-│       ├── companies.py   # Company endpoints (read-only)
-│       ├── locations.py   # Location endpoints (read-only)
-│       ├── skills.py      # Skills endpoints (read-only)
-│       ├── categories.py  # Category endpoints (read-only)
-│       ├── scraping.py    # Scraping management endpoints
-│       └── scraping_sites.py # Scrape sites endpoints (under /scraping/sites)
+├── services/              # Business Logic (Reusable Methods)
+│   ├── job_service.py     # Complex FTS queries & lifecycle logic
+│   ├── scraping_service.py # Run creation, Hashing, & Inactivation logic
+│   ├── skill_matcher.py   # AI-to-DB Skill mapping & canonicalization
+│   ├── company_service.py # Company deduplication & enrichment
+│   ├── location_service.py # Geo-normalization & remote logic
+│   └── category_service.py # Industry & Role classification
 │
-├── schemas/               # Pydantic models (request/response)
-│   ├── __init__.py
-│   ├── common.py          # Common schemas (pagination, responses)
-│   ├── job.py             # Job response schemas (no request schemas for creation)
-│   ├── company.py         # Company schemas
-│   ├── location.py        # Location schemas
-│   ├── skill.py           # Skill schemas
-│   └── scraping.py        # Scraping request/response schemas
+├── schemas/               # Pydantic (Data Validation & Serialization)
+│   ├── common.py          # Pagination, Sorting & Error schemas
+│   ├── job.py             # Job request/response shapes
+│   ├── scraping.py        # Search criteria & Run shapes
+│   └── skill.py           # Skill, Variant & Category shapes
 │
-└── services/              # Business logic layer
-    ├── __init__.py
-    ├── job_service.py     # Job business logic (read operations)
-    ├── company_service.py # Company business logic (read operations)
-    ├── location_service.py # Location business logic (read operations)
-    ├── skill_service.py   # Skill business logic (read operations)
-    └── scraping_service.py # Scraping business logic (create runs, track status)
+├── models.py              # SQLAlchemy Core Models (FTS & Freshness columns)
+└── database.py            # Session & Engine management
 ```
 
 ---
 
-## Implementation Approach
+## Technical Notes for Development
 
-### Architecture Pattern
-- **Layered Architecture**: API → Services → Database
-- **Separation of Concerns**: 
-  - API routes handle HTTP requests/responses
-  - Services contain business logic
-  - Models represent database entities
-  - Schemas handle validation and serialization
+### 1. The Canonical Hashing Pipeline
+Before creating a `SearchCriteria` record, execute:
+1. **Scalar Normalization**: Lowercase/strip `job_role`, `location`, `language`.
+2. **Array Normalization**: Lowercase, deduplicate, and **alphabetically sort** `skills`.
+3. **Hashing**: SHA-256 of the resulting deterministic JSON string.
 
-### Key Components
+### 2. Differential Inactivation Logic
+After a successful run (`completed` status + `jobs_found > 0`):
+1. Update `last_seen_at` for all found jobs.
+2. For jobs in the same `cohort_hash` where `last_seen_at < run.started_at`:
+   - Increment `missing_count`.
+   - If `missing_count >= 2`, set `is_active = FALSE`.
 
-1. **Schemas (Pydantic Models)**
-   - Request schemas for scraping configuration validation
-   - Response schemas for serialization (jobs, scraping runs, etc.)
-   - Common schemas (pagination, error responses)
-   - **Note**: No job creation request schemas (jobs created by scraper only)
-
-2. **Services (Business Logic)**
-   - Database queries (read operations for jobs, companies, etc.)
-   - Scraping run management (create runs, update status, track progress)
-   - Data transformation
-   - Business rules
-   - Error handling
-
-3. **API Routes (FastAPI Endpoints)**
-   - HTTP method handlers
-   - Request validation
-   - Response formatting
-   - Dependency injection (database sessions)
-
-### Database Session Management
-- Use `get_db()` dependency from `easyhire_scout.database`
-- Sessions are automatically closed after request
-- Example: `db: Session = Depends(get_db)`
-
-### Error Handling
-- Use FastAPI's HTTPException for errors
-- Standard error response format:
-  ```json
-  {
-    "detail": "Error message here"
-  }
-  ```
-- Common HTTP status codes:
-  - `200` - Success
-  - `201` - Created (for scraping run creation)
-  - `400` - Bad Request
-  - `422` - Unprocessable Entity (FastAPI validation errors)
-  - `404` - Not Found
-  - `500` - Internal Server Error
+### 3. Search ranking (FTS)
+Always sort list endpoints by relevancy unless an explicit sort is provided:
+```python
+query = query.order_by(func.ts_rank(Job.fts_vector, func.plainto_tsquery(q)).desc())
+```
 
 ---
 
-## Implementation Priority Order
-
-### Phase 1: Foundation ✅ (Completed)
-1. ✅ Set up project structure (directories, `__init__.py` files)
-2. ✅ Create common schemas (pagination, responses)
-3. ✅ Set up FastAPI app instance with CORS
-4. ✅ Create main router structure
-
-### Phase 2: Scraping API (Priority 1)
-1. Create scraping schemas (request for `POST /scraping/start`, response for runs)
-2. Implement scraping service:
-   - Create scraping run record
-   - Update run status
-   - Track jobs found/saved
-   - Handle errors
-3. Implement scraping API routes:
-   - `POST /api/v1/scraping/start` - Accept search criteria, create run, trigger scraper (async)
-   - `GET /api/v1/scraping/runs` - List runs with filtering
-   - `GET /api/v1/scraping/runs/{run_id}` - Get run details
-   - `GET /api/v1/scraping/runs/{run_id}/jobs` - Get jobs from run
-   - `GET /api/v1/scraping/runs/{run_id}/errors` - Get errors from run
-   - `GET /api/v1/scraping/sites` - List available scraping sources
-4. Test scraping endpoints
-
-**Note**: The actual scraping logic (web scraping, parsing, etc.) is **not** part of Stage 1 API implementation. The API will:
-- Accept scraping configuration
-- Create a `ScrapeRun` record
-- Return immediately with `status: "running"`
-- The Celery worker will pick up the task, update the run status, and create job records
-
-### Phase 3: Jobs API (Priority 2 - Read-Only)
-1. Create job response schemas (no request schemas for creation)
-2. Implement job service (read operations only):
-   - List jobs with filtering, pagination, search
-   - Get job by ID with all related data
-   - Filter by scrape run, scrape site, etc.
-3. Implement job API routes:
-   - `GET /api/v1/jobs` - List jobs with query parameters
-   - `GET /api/v1/jobs/{job_id}` - Get job details
-4. Test job endpoints
-
-### Phase 4: Supporting APIs (Priority 3)
-1. Companies API (read-only)
-2. Locations API (read-only)
-3. Skills API (read-only)
-4. Categories API (read-only)
-
-### Phase 5: Testing & Refinement
-1. Test all endpoints
-2. Verify response formats
-3. Test error handling
-4. Performance testing (if needed)
-5. Integration testing with scraping bot (when available)
-
----
-
-## Technical Notes
-
-### Search Implementation (PostgreSQL FTS)
-- Use SQLAlchemy `func.to_tsvector` and `func.plainto_tsquery`.
-- Leverage existing GIN indexes: `idx_jobs_title` and `idx_jobs_description_fts`.
-- Query structure:
-  ```python
-  query = query.filter(
-      text("to_tsvector('english', jobs.description) @@ plainto_tsquery('english', :search_term)")
-  ).params(search_term=search_term)
-  ```
-
-### Differential Inactivation (The Freshness Invariant)
-- After a successful scrape run:
-  1. Identify the `SearchCriteria` cohort of the current run.
-  2. Mark `is_active = False` for all jobs where:
-     - `search_criteria_id == current_run.search_criteria_id`
-     - `last_seen_at < current_run.started_at`
-
-### Soft Delete Implementation
-- Update `is_active=False` instead of deleting
-- Filter queries by default: `query.filter(Job.is_active == True)`
-- Allow override for admin views if needed (via `is_active` query parameter)
-
-### Related Data Loading
-- Use SQLAlchemy's `joinedload()` or `selectinload()` for eager loading
-- Load company, location, skills, languages, categories in single query
-- Avoid N+1 query problems
-- Example:
-  ```python
-  query = query.options(
-      joinedload(Job.company),
-      joinedload(Job.location),
-      selectinload(Job.skills),
-      selectinload(Job.languages),
-      selectinload(Job.categories)
-  )
-  ```
-
-### Pagination
-- Default: 20 items per page
-- Maximum: 100 items per page (enforce limit)
-- Calculate `total_pages` from `total` and `page_size`
-- Use `PaginationParams` schema from `common.py`
-
-### Scraping Run Status Management
-- Status values: `"running"`, `"completed"`, `"failed"`, `"cancelled"`
-- When `POST /scraping/start` is called:
-  1. Resolve `SearchCriteria` (create if new)
-  2. Create `ScrapeRun` record with `status="running"` and link to `search_criteria_id`
-  3. Enqueue Celery task with the run ID
-  4. Return immediately with run ID
-  5. Celery worker updates run status and creates job records
-
----
-
-## Next Steps
-
-1. ✅ Review this plan
-2. ✅ Set up project structure together
-3. ✅ Implement Phase 1 (Foundation) together
-4. **Next**: Implement Phase 2 (Scraping API) together
-5. Gradually implement remaining phases
-6. Test and refine as we go
-
----
-
-## Questions for Future Consideration
-
-- **Authentication/Authorization**: Not needed for Stage 1, but will be needed for production
-- **Rate Limiting**: Deferred to later stages
-- **Caching Strategy**: For future optimization (e.g., cache company/location lookups)
-- **API Versioning Strategy**: Currently v1, plan for future versions
-- **Webhook Support**: For scraping completion notifications (future feature)
-- **Scraping Bot Integration**: The actual scraping logic is a separate component that will:
-  - Read scraping run configuration from database
-  - Execute web scraping
-  - Create job records via service layer
-  - Update scraping run status
-  - Log errors to `scrape_errors` table
-- **Language Strictness Logic**: How to determine if a job is "strictly" in a language (may require NLP/LLM analysis in future stages)
-
----
-
-**Document Version**: 2.0  
-**Last Updated**: 2026-04-22 (Architecture & Consistency Pass)  
-**Status**: Planning Complete - Ready for Implementation  
-**Key Change**: Revised to reflect job scraper bot architecture (jobs only created by scraping, no manual job creation endpoints)
+**Document Version**: 3.1  
+**Last Updated**: 2026-05-12  
+**Status**: Finalized for Implementation  
+**Key Change**: Restored full service architecture and detailed response bodies updated for architectural alignment.
