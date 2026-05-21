@@ -40,6 +40,17 @@ class ScrapingStartResponse(BaseModel):
     started_at: datetime
     message: str
 
+class ScrapingStatusResponse(BaseModel):
+    """Response schema for checking scraping run status"""
+    run_id: int
+    status: str
+    jobs_found: int
+    jobs_saved: int
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+    scrape_site_name: str
+    search_criteria: SearchCriteria
+
 class ScrapeRunResponse(BaseModel):
     """Response schema for a scraping run"""
     id: int

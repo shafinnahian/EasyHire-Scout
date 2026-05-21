@@ -105,6 +105,7 @@ class JobResponse(BaseModel):
     is_duplicate: bool = False
     created_at: datetime
     updated_at: datetime
+    relevance_score: float = 0.0
     
     # Related entities
     company: Optional[CompanyInfo] = None

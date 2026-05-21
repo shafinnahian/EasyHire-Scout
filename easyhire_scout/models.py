@@ -5,7 +5,7 @@ PostgreSQL DDL - 3NF Normalized
 
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Optional, List
 
 from sqlalchemy import (
     Boolean,
@@ -169,6 +169,11 @@ class ScrapeRun(Base):
     search_criteria_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("search_criteria.id", ondelete="SET NULL")
     )
+    
+    # Relationships
+    scrape_site: Mapped[Optional["ScrapeSite"]] = relationship()
+    search_criteria: Mapped[Optional["SearchCriteria"]] = relationship()
+
     started_at: Mapped[datetime] = mapped_column(
         TIMESTAMP, server_default=func.now()
     )
@@ -234,6 +239,16 @@ class Job(Base):
     source_site_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("scrape_sites.id", ondelete="SET NULL")
     )
+
+    # Relationships
+    company: Mapped[Optional["Company"]] = relationship()
+    location: Mapped[Optional["Location"]] = relationship()
+    scrape_run: Mapped[Optional["ScrapeRun"]] = relationship()
+    search_criteria: Mapped[Optional["SearchCriteria"]] = relationship()
+    source_site: Mapped[Optional["ScrapeSite"]] = relationship()
+    skills: Mapped[List["Skill"]] = relationship(secondary="job_skills")
+    languages: Mapped[List["JobLanguage"]] = relationship()
+    categories: Mapped[List["JobCategory"]] = relationship(secondary="job_categories_link")
 
     # External identifiers
     external_id: Mapped[Optional[str]] = mapped_column(String(255))
